@@ -1,0 +1,588 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#020814">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<title>深海波纹</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #020814;
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
+  body {
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  }
+  canvas {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+    touch-action: none;
+  }
+  .title {
+    position: fixed;
+    top: calc(18px + env(safe-area-inset-top));
+    left: calc(20px + env(safe-area-inset-left));
+    color: rgba(170, 225, 255, 0.5);
+    font-size: 12px;
+    letter-spacing: 0.4em;
+    pointer-events: none;
+  }
+  .hint {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: calc(15vh + env(safe-area-inset-bottom));
+    text-align: center;
+    color: rgba(190, 240, 255, 0.9);
+    font-size: 15px;
+    letter-spacing: 0.25em;
+    text-shadow: 0 0 14px rgba(80, 200, 255, 0.7);
+    pointer-events: none;
+    transition: opacity 1.4s ease;
+  }
+  .hint span { display: inline-block; animation: breathe 2.8s ease-in-out infinite; }
+  .hint.hide { opacity: 0; }
+  @keyframes breathe { 0%, 100% { opacity: 0.4; } 50% { opacity: 1; } }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="title">深海波纹</div>
+<div class="hint" id="hint"><span>用手指划过水面</span></div>
+<noscript><p style="color:#9cf;text-align:center;margin-top:40vh">需要开启 JavaScript</p></noscript>
+
+<script>
+(() => {
+  'use strict';
+
+  let canvas = document.getElementById('c');
+  const hint = document.getElementById('hint');
+  const reduceMotion = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  // ---------------------------------------------------------------------------
+  // 水面模拟：经典的双缓冲高度场波动方程，在 CPU 上以低分辨率网格运行
+  // ---------------------------------------------------------------------------
+  const TARGET_CELLS = 42000;   // 网格总格子数，决定波纹细腻度
+  const DAMPING = 0.991;        // 每步衰减
+  const SIM_HZ = 120;           // 固定步长频率
+  const SLOPE_K = 90;           // 斜率编码到 0..255 的放大系数
+  const HEIGHT_K = 70;          // 高度编码系数
+
+  let viewW = 0, viewH = 0;     // CSS 像素
+  let cols = 0, rows = 0;
+  let cellX = 4, cellY = 4;
+  let cur, prev;                // Float32Array 高度场
+  let pixels, pixels8;          // 编码后的 RGBA（R/G = 斜率，B = 高度）
+
+  function initGrid() {
+    const cell = Math.max(2.5, Math.sqrt((viewW * viewH) / TARGET_CELLS));
+    cols = Math.max(16, Math.round(viewW / cell));
+    rows = Math.max(16, Math.round(viewH / cell));
+    cellX = viewW / cols;
+    cellY = viewH / rows;
+    cur = new Float32Array(cols * rows);
+    prev = new Float32Array(cols * rows);
+    pixels = new Uint8ClampedArray(cols * rows * 4);
+    pixels8 = new Uint8Array(pixels.buffer);
+    for (let i = 0; i < pixels.length; i += 4) {
+      pixels[i] = 128; pixels[i + 1] = 128; pixels[i + 2] = 128; pixels[i + 3] = 255;
+    }
+  }
+
+  function step() {
+    const c = cur, p = prev, w = cols;
+    for (let y = 1; y < rows - 1; y++) {
+      let i = y * w + 1;
+      for (let x = 1; x < w - 1; x++, i++) {
+        p[i] = ((c[i - 1] + c[i + 1] + c[i - w] + c[i + w]) * 0.5 - p[i]) * DAMPING;
+      }
+    }
+    cur = p;
+    prev = c;
+  }
+
+  function encode() {
+    const c = cur, w = cols, o = pixels;
+    for (let y = 1; y < rows - 1; y++) {
+      let i = y * w + 1;
+      let k = i * 4;
+      for (let x = 1; x < w - 1; x++, i++, k += 4) {
+        o[k] = 128 + (c[i + 1] - c[i - 1]) * SLOPE_K;
+        o[k + 1] = 128 + (c[i + w] - c[i - w]) * SLOPE_K;
+        o[k + 2] = 128 + c[i] * HEIGHT_K;
+      }
+    }
+  }
+
+  // 在 (x, y) 处（CSS 像素）压下一个平滑的余弦形凹坑
+  function disturb(x, y, radius, strength) {
+    const gx = x / cellX, gy = y / cellY;
+    const rx = radius / cellX, ry = radius / cellY;
+    const x0 = Math.max(1, Math.floor(gx - rx)), x1 = Math.min(cols - 2, Math.ceil(gx + rx));
+    const y0 = Math.max(1, Math.floor(gy - ry)), y1 = Math.min(rows - 2, Math.ceil(gy + ry));
+    for (let j = y0; j <= y1; j++) {
+      const dy = (j - gy) / ry;
+      for (let i = x0; i <= x1; i++) {
+        const dx = (i - gx) / rx;
+        const d = Math.sqrt(dx * dx + dy * dy);
+        if (d >= 1) continue;
+        const idx = j * cols + i;
+        let v = cur[idx] + strength * (Math.cos(d * Math.PI) + 1) * 0.5;
+        cur[idx] = v > 4 ? 4 : v < -4 ? -4 : v;
+      }
+    }
+  }
+
+  function fingerRadius() {
+    return Math.max(10, Math.min(viewW, viewH) * 0.032);
+  }
+
+  function splash(x, y, k) {
+    disturb(x, y, fingerRadius() * 1.5, -1.1 * k);
+  }
+
+  function drag(x0, y0, x1, y1, k) {
+    const dx = x1 - x0, dy = y1 - y0;
+    const dist = Math.hypot(dx, dy);
+    if (dist < 0.5) return;
+    const r = fingerRadius();
+    const spacing = Math.max(Math.min(cellX, cellY), r * 0.35);
+    const n = Math.min(80, Math.ceil(dist / spacing));
+    for (let s = 1; s <= n; s++) {
+      const t = s / n;
+      disturb(x0 + dx * t, y0 + dy * t, r, -0.26 * k);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // WebGL 渲染：折射深海背景 + 波纹聚光 + 镜面高光 + 生物荧光
+  // ---------------------------------------------------------------------------
+  const VERT = `
+    attribute vec2 aPos;
+    varying vec2 vUv;
+    void main() {
+      vUv = vec2(aPos.x * 0.5 + 0.5, 0.5 - aPos.y * 0.5);
+      gl_Position = vec4(aPos, 0.0, 1.0);
+    }`;
+
+  const FRAG = `
+    #ifdef GL_FRAGMENT_PRECISION_HIGH
+    precision highp float;
+    #else
+    precision mediump float;
+    #endif
+
+    varying vec2 vUv;
+    uniform sampler2D uWave;
+    uniform vec2 uTexel;
+    uniform vec2 uRes;
+    uniform float uTime;
+
+    float hash(vec2 p) {
+      p = fract(p * vec2(123.34, 456.21));
+      p += dot(p, p + 45.32);
+      return fract(p.x * p.y);
+    }
+
+    // 可平铺的水下焦散图案
+    float caustic(vec2 uv, float t) {
+      vec2 p = mod(uv * 6.28318, 6.28318) - 250.0;
+      vec2 i = p;
+      float c = 1.0;
+      const float inten = 0.005;
+      for (int n = 0; n < 4; n++) {
+        float tt = t * (1.0 - (3.5 / float(n + 1)));
+        i = p + vec2(cos(tt - i.x) + sin(tt + i.y), sin(tt - i.y) + cos(tt + i.x));
+        c += 1.0 / length(vec2(p.x / (sin(i.x + tt) / inten), p.y / (cos(i.y + tt) / inten)));
+      }
+      c /= 4.0;
+      c = 1.17 - pow(c, 1.4);
+      return pow(abs(c), 8.0);
+    }
+
+    // 缓缓下沉的“海洋雪”微粒
+    float snowLayer(vec2 p, float t, float scale, float speed, float size) {
+      p *= scale;
+      p.y -= t * speed;
+      p.x += sin(p.y * 0.35 + t * 0.3 + scale) * 0.25;
+      vec2 id = floor(p);
+      vec2 f = fract(p) - 0.5;
+      float h = hash(id + scale);
+      vec2 o = vec2(hash(id + 3.1), hash(id + 7.7)) - 0.5;
+      float d = length(f - o * 0.6);
+      float tw = 0.55 + 0.45 * sin(t * 1.7 + h * 40.0);
+      return smoothstep(size, 0.0, d) * step(0.6, h) * tw;
+    }
+
+    vec3 scene(vec2 uv, float t) {
+      float aspect = uRes.x / uRes.y;
+      vec2 p = vec2((uv.x - 0.5) * aspect, uv.y);
+      float depth = clamp(uv.y, 0.0, 1.0);
+
+      vec3 shallow = vec3(0.04, 0.30, 0.46);
+      vec3 mid     = vec3(0.01, 0.10, 0.21);
+      vec3 deep    = vec3(0.0, 0.012, 0.04);
+      vec3 col = mix(shallow, mid, smoothstep(0.0, 0.5, depth));
+      col = mix(col, deep, smoothstep(0.4, 1.05, depth));
+
+      // 从海面斜射下来的光柱
+      vec2 d = p - vec2(0.25, -0.7);
+      float ang = atan(d.x, d.y);
+      float rays = (sin(ang * 23.0 + t * 0.31) * 0.5 + 0.5)
+                 * (sin(ang * 37.0 - t * 0.23 + 1.3) * 0.5 + 0.5);
+      rays += (sin(ang * 11.0 + t * 0.17) * 0.5 + 0.5) * 0.35;
+      rays *= rays;
+      col += vec3(0.22, 0.52, 0.62) * rays * (1.0 - smoothstep(0.0, 0.9, depth)) * 0.24;
+
+      // 浅层焦散
+      float c = caustic(p * 0.85 + vec2(0.0, t * 0.012), t * 0.42);
+      col += vec3(0.30, 0.72, 0.85) * c * (1.0 - smoothstep(0.0, 0.75, depth)) * 0.3;
+
+      // 海洋雪
+      float s = snowLayer(p, t, 7.0, 0.22, 0.09) * 0.55
+              + snowLayer(p, t, 13.0, 0.40, 0.07) * 0.75
+              + snowLayer(p, t, 24.0, 0.65, 0.08) * 0.5;
+      col += vec3(0.55, 0.82, 1.0) * s * (0.35 + 0.65 * (1.0 - depth * 0.6));
+
+      return col;
+    }
+
+    vec2 slopeAt(vec2 uv) {
+      return (texture2D(uWave, uv).rg * 255.0 - 128.0) / 127.0;
+    }
+
+    void main() {
+      vec2 uv = vUv;
+      vec4 w = texture2D(uWave, uv);
+      vec2 s = (w.rg * 255.0 - 128.0) / 127.0;
+      float h = (w.b * 255.0 - 128.0) / 127.0;
+
+      // 斜率的散度 ≈ 曲率：凹处聚光、凸处变暗
+      float div = (slopeAt(uv + vec2(uTexel.x, 0.0)).x - slopeAt(uv - vec2(uTexel.x, 0.0)).x)
+                + (slopeAt(uv + vec2(0.0, uTexel.y)).y - slopeAt(uv - vec2(0.0, uTexel.y)).y);
+
+      vec3 col = scene(uv + s * 0.045, uTime);
+
+      float focus = -div * 2.2;
+      col += vec3(0.25, 0.75, 1.0) * max(focus, 0.0) * 0.35;
+      col *= 1.0 - min(max(-focus, 0.0) * 0.18, 0.5);
+
+      // 生物荧光：被扰动的水会发出幽蓝的光
+      float energy = abs(h) * 0.9 + length(s) * 0.8;
+      vec3 bio = mix(vec3(0.0, 0.45, 1.0), vec3(0.35, 1.0, 0.92), smoothstep(0.15, 0.8, energy));
+      col += bio * smoothstep(0.02, 0.8, energy) * 0.6;
+
+      // 镜面高光
+      vec3 N = normalize(vec3(-s * 1.6, 1.0));
+      vec3 H = normalize(normalize(vec3(-0.25, -0.55, 1.0)) + vec3(0.0, 0.0, 1.0));
+      float spec = max(pow(max(dot(N, H), 0.0), 90.0) - pow(H.z, 90.0), 0.0);
+      col += vec3(0.75, 0.95, 1.0) * spec * 1.3;
+
+      // 暗角
+      vec2 q = uv - 0.5;
+      col *= 1.0 - dot(q * vec2(1.1, 0.9), q * vec2(1.1, 0.9)) * 1.1;
+
+      // 抖动，消除暗部色带
+      col += (hash(gl_FragCoord.xy + fract(uTime * 7.0) * 100.0) - 0.5) * (1.5 / 255.0);
+
+      gl_FragColor = vec4(max(col, 0.0), 1.0);
+    }`;
+
+  let gl = null, prog = null, tex = null, uni = {};
+  let texW = 0, texH = 0;
+  let ctx2d = null, off = null, offCtx = null, offImg = null;
+  let renderScale = 1;
+  let contextLost = false;
+
+  function compile(type, src) {
+    const sh = gl.createShader(type);
+    gl.shaderSource(sh, src);
+    gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+      throw new Error(gl.getShaderInfoLog(sh) || 'shader compile failed');
+    }
+    return sh;
+  }
+
+  function setupGL() {
+    const opts = { antialias: false, alpha: false, depth: false, stencil: false, premultipliedAlpha: false, powerPreference: 'high-performance' };
+    gl = canvas.getContext('webgl', opts) || canvas.getContext('experimental-webgl', opts);
+    if (!gl) return false;
+    try {
+      prog = gl.createProgram();
+      gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERT));
+      gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FRAG));
+      gl.linkProgram(prog);
+      if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+    } catch (err) {
+      console.warn('WebGL 初始化失败，改用 2D 渲染：', err);
+      gl = null;
+      return false;
+    }
+    gl.useProgram(prog);
+
+    const buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+    const loc = gl.getAttribLocation(prog, 'aPos');
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+    tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    texW = texH = 0;
+
+    uni = {
+      wave: gl.getUniformLocation(prog, 'uWave'),
+      texel: gl.getUniformLocation(prog, 'uTexel'),
+      res: gl.getUniformLocation(prog, 'uRes'),
+      time: gl.getUniformLocation(prog, 'uTime'),
+    };
+    gl.uniform1i(uni.wave, 0);
+    return true;
+  }
+
+  function renderGL(t) {
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    if (texW !== cols || texH !== rows) {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, cols, rows, 0, gl.RGBA, gl.UNSIGNED_BYTE, pixels8);
+      texW = cols; texH = rows;
+    } else {
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, cols, rows, gl.RGBA, gl.UNSIGNED_BYTE, pixels8);
+    }
+    gl.uniform2f(uni.texel, 1 / cols, 1 / rows);
+    gl.uniform2f(uni.res, canvas.width, canvas.height);
+    gl.uniform1f(uni.time, t);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+
+  // 不支持 WebGL 时的简化渲染：直接把高度场着色后放大绘制
+  function render2D() {
+    if (!off || off.width !== cols || off.height !== rows) {
+      off = document.createElement('canvas');
+      off.width = cols; off.height = rows;
+      offCtx = off.getContext('2d');
+      offImg = offCtx.createImageData(cols, rows);
+    }
+    const d = offImg.data, src = pixels;
+    for (let y = 0; y < rows; y++) {
+      const depth = y / rows;
+      const br = 10 * (1 - depth) + 1, bg = 70 * (1 - depth) + 4, bb = 110 * (1 - depth) + 12;
+      for (let x = 0; x < cols; x++) {
+        const k = (y * cols + x) * 4;
+        const sx = (src[k] - 128) / 127, sy = (src[k + 1] - 128) / 127, h = (src[k + 2] - 128) / 127;
+        const e = Math.min(1, Math.abs(h) * 0.9 + Math.hypot(sx, sy) * 0.8);
+        const light = (-sx * 0.3 - sy * 0.6) * 120;
+        d[k] = br + light * 0.6 + e * 40;
+        d[k + 1] = bg + light + e * 170;
+        d[k + 2] = bb + light + e * 200;
+        d[k + 3] = 255;
+      }
+    }
+    offCtx.putImageData(offImg, 0, 0);
+    ctx2d.imageSmoothingEnabled = true;
+    ctx2d.drawImage(off, 0, 0, canvas.width, canvas.height);
+  }
+
+  // 选择渲染器（须在绑定事件之前，因为降级时可能要换一块新画布）
+  if (!setupGL()) {
+    ctx2d = canvas.getContext('2d');
+    if (!ctx2d) {
+      // 画布已被失败的 WebGL 占用，换一块新的
+      const fresh = canvas.cloneNode(false);
+      canvas.parentNode.replaceChild(fresh, canvas);
+      canvas = fresh;
+      ctx2d = canvas.getContext('2d');
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // 尺寸与分辨率
+  // ---------------------------------------------------------------------------
+  const MAX_PIXELS = 1.3e6;     // 片元着色器的像素预算
+
+  function pickScale() {
+    const dpr = window.devicePixelRatio || 1;
+    return Math.max(0.5, Math.min(dpr, 2, Math.sqrt(MAX_PIXELS / Math.max(1, viewW * viewH))));
+  }
+
+  function applyCanvasSize() {
+    const s = gl ? renderScale : 1;
+    canvas.width = Math.max(1, Math.round(viewW * s));
+    canvas.height = Math.max(1, Math.round(viewH * s));
+  }
+
+  function resize() {
+    const w = canvas.clientWidth || window.innerWidth;
+    const h = canvas.clientHeight || window.innerHeight;
+    if (w === viewW && h === viewH) return;
+    viewW = w; viewH = h;
+    renderScale = pickScale();
+    initGrid();
+    applyCanvasSize();
+    perf.reset();
+  }
+
+  // 帧率过低时自动降低渲染分辨率
+  const perf = {
+    frames: 0, total: 0,
+    reset() { this.frames = 0; this.total = 0; },
+    sample(dt) {
+      if (!gl || dt > 0.25) return;
+      this.frames++; this.total += dt;
+      if (this.frames < 90) return;
+      const avg = this.total / this.frames;
+      this.reset();
+      if (avg > 0.024 && renderScale > 0.6) {
+        renderScale = Math.max(0.6, renderScale * 0.78);
+        applyCanvasSize();
+      }
+    },
+  };
+
+  // ---------------------------------------------------------------------------
+  // 交互
+  // ---------------------------------------------------------------------------
+  const pointers = new Map();
+  let touched = false;
+
+  function interacted() {
+    if (touched) return;
+    touched = true;
+    hint.classList.add('hide');
+  }
+
+  function localPos(e) {
+    const r = canvas.getBoundingClientRect();
+    return [e.clientX - r.left, e.clientY - r.top];
+  }
+
+  canvas.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    if (canvas.setPointerCapture) {
+      try { canvas.setPointerCapture(e.pointerId); } catch (_) { /* 忽略 */ }
+    }
+    const [x, y] = localPos(e);
+    pointers.set(e.pointerId, { x, y });
+    splash(x, y, 1);
+    interacted();
+  });
+
+  canvas.addEventListener('pointermove', (e) => {
+    const [x, y] = localPos(e);
+    const p = pointers.get(e.pointerId);
+    if (!p) { pointers.set(e.pointerId, { x, y }); return; }
+    // 鼠标悬停时轻轻扰动，按下或手指划过时用力
+    const pressed = e.pointerType !== 'mouse' || (e.buttons & 1) === 1;
+    drag(p.x, p.y, x, y, pressed ? 1 : 0.35);
+    p.x = x; p.y = y;
+    if (pressed) interacted();
+  });
+
+  function release(e) {
+    if (e.pointerType !== 'mouse' || e.type !== 'pointerup') pointers.delete(e.pointerId);
+  }
+  canvas.addEventListener('pointerup', release);
+  canvas.addEventListener('pointercancel', release);
+  canvas.addEventListener('pointerleave', release);
+
+  // 阻止 iOS 上的回弹、双击缩放和长按菜单
+  document.addEventListener('touchmove', (e) => e.preventDefault(), { passive: false });
+  document.addEventListener('gesturestart', (e) => e.preventDefault());
+  document.addEventListener('dblclick', (e) => e.preventDefault());
+  document.addEventListener('contextmenu', (e) => e.preventDefault());
+
+  window.addEventListener('resize', resize);
+  window.addEventListener('orientationchange', () => setTimeout(resize, 200));
+  if (window.visualViewport) window.visualViewport.addEventListener('resize', resize);
+
+  // ---------------------------------------------------------------------------
+  // 主循环
+  // ---------------------------------------------------------------------------
+  let last = 0, acc = 0, nextDrop = 0;
+  const start = performance.now();
+
+  function ambient(now) {
+    if (reduceMotion || now < nextDrop) return;
+    nextDrop = now + 1600 + Math.random() * 2600;
+    const x = viewW * (0.1 + Math.random() * 0.8);
+    const y = viewH * (0.1 + Math.random() * 0.8);
+    disturb(x, y, fingerRadius() * (0.8 + Math.random() * 0.8), -(0.45 + Math.random() * 0.45));
+  }
+
+  function frame(now) {
+    requestAnimationFrame(frame);
+    if (contextLost) return;
+
+    const dt = last ? Math.min((now - last) / 1000, 0.1) : 1 / 60;
+    last = now;
+    perf.sample(dt);
+
+    ambient(now);
+    acc += dt;
+    let steps = 0;
+    while (acc >= 1 / SIM_HZ && steps < 6) {
+      step();
+      acc -= 1 / SIM_HZ;
+      steps++;
+    }
+    if (steps === 6) acc = 0;
+    encode();
+
+    const t = ((now - start) / 1000) % 3600;
+    if (gl) renderGL(t);
+    else render2D();
+  }
+
+  canvas.addEventListener('webglcontextlost', (e) => {
+    e.preventDefault();
+    contextLost = true;
+  });
+  canvas.addEventListener('webglcontextrestored', () => {
+    setupGL();
+    contextLost = false;
+  });
+
+  document.addEventListener('visibilitychange', () => {
+    last = 0;
+    perf.reset();
+  });
+
+  // ---------------------------------------------------------------------------
+  // 启动
+  // ---------------------------------------------------------------------------
+  resize();
+
+  // 开场几滴水，让画面一打开就是活的
+  if (!reduceMotion) {
+    [[0.5, 0.42, 0], [0.3, 0.6, 450], [0.72, 0.68, 900]].forEach(([fx, fy, delay]) => {
+      setTimeout(() => splash(viewW * fx, viewH * fy, 0.8), delay);
+    });
+    nextDrop = performance.now() + 2500;
+  }
+
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
