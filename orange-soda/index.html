@@ -1443,13 +1443,22 @@ const LIQ_SURF_FRAG = /* glsl */`
     vec3 Nw = normalize(mat3(uModel) * vNL);
     if (dot(Nw, V) < 0.0) discard;
     if (uFoamH > 0.004) {
-      vec2 cuv = vL.xz / 0.018 + vec2(uTime * 0.1, 0.0);
+      // foam head seen from above: bubbles of mixed sizes, little domes catching the light
+      vec2 cuv = vL.xz / 0.016 + vec2(uTime * 0.06, 0.0);
       vec3 fc = sdFoamCells(cuv);
+      vec3 fc2 = sdFoamCells(cuv * 0.38 + 11.0);
       float fw = length(fwidth(cuv));
-      float memb = (1.0 - smoothstep(0.0, 0.1 + fw * 0.5, fc.y - fc.x)) * (1.0 - smoothstep(0.25, 0.6, fw));
+      float fade1 = 1.0 - smoothstep(0.25, 0.6, fw), fade2 = 1.0 - smoothstep(0.6, 1.6, fw);
+      float memb = (1.0 - smoothstep(0.0, 0.1 + fw * 0.5, fc.y - fc.x)) * fade1;
+      float memb2 = (1.0 - smoothstep(0.0, 0.07 + fw * 0.15, fc2.y - fc2.x)) * fade2;
+      float dome2 = (1.0 - smoothstep(0.0, 0.7, fc2.x)) * fade2;
+      float lump = sdNoise2(vL.xz * 16.0 + 3.0) * 0.6 + sdNoise2(vL.xz * 37.0) * 0.4;
       float ndl = max(dot(Nw, uSunDir), 0.0);
       vec3 lit = uFoamAmb + uSunRad * uSunVisC * (0.1 + 0.35 * ndl);
-      vec3 col = vec3(1.0, 0.94, 0.85) * lit * (0.8 + 0.2 * smoothstep(0.1, 0.8, fc.x)) + lit * memb * 0.25;
+      vec3 base = mix(vec3(1.0, 0.78, 0.52), vec3(1.0, 0.95, 0.87), 0.35 + 0.65 * lump);
+      vec3 col = base * lit * (0.74 + 0.28 * lump) * (1.0 - 0.22 * memb - 0.3 * memb2);
+      col += lit * 0.22 * dome2 * dome2 + uSunRad * uSunVisC * 0.35 * pow(dome2, 6.0) * fc2.z;
+      col *= 0.9 + 0.1 * smoothstep(0.1, 0.8, fc.x);
       gl_FragColor = vec4(col, 1.0);
       return;
     }
